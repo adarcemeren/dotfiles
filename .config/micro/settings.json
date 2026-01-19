@@ -1,0 +1,18 @@
+{
+    "/etc/*": {
+        "filetype": "conf"
+    },
+    "/home/*/.config/*": {
+        "filetype": "conf"
+    },
+    "autocomplete_tooltip.EnableCursorUpDown": true,
+    "autosu": true,
+    "lsppp.autostart": true,
+    "lsppp.debug": true,
+    "colorscheme": "gruvbox-tc",
+    "lsp.autocompleteDetails": true,
+    "lsp.ignoreMessages": "LS message1 to ignore|LS message 2 to ignore|...",
+    "lsp.ignoreTriggerCharacters": "completion,signature",
+    "lsp.server": "clangd",
+    "mkparents": true
+}

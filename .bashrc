@@ -82,3 +82,5 @@ alias jctl="journalctl -p 3 -xb"
 # alias rip="expac --timefmt='%Y-%m-%d %T' '%l\t%n %v' | sort | tail -200 | nl"
 
 export STM32_PRG_PATH=/home/ace/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin
+
+. "$HOME/.cargo/env"

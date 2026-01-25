@@ -1,12 +1,8 @@
 -- ============================================================================
 -- LSP++ (Micro Editor Plugin)
 -- ============================================================================
--- Version: 1.0.0
--- Description: A high-performance, lightweight LSP client for C/C++ in Micro.
---              LSP++ provides seamless auto-completion, intelligent formatting,
---              and real-time diagnostics by interfacing with the clangd server.
---              Engineered for stability, it features dynamic viewport management
---              to prevent UI overflows and robust buffer synchronization.
+-- Version: 1.0.1 (Adaptive Height Fix)
+-- Description: Stability release combining visual fix and crash safety.
 -- ============================================================================
 local micro = import("micro")
 local config = import("micro/config")
@@ -20,14 +16,9 @@ local strings = import("strings")
 -- ============================================================================
 -- 1. JSON PARSER ENGINE
 -- ============================================================================
--- Micro's Lua API does not expose a native JSON parser. To enable JSON-RPC
--- communication with the language server, we implement a compliant recursive
--- descent parser here. This handles object nesting and string escaping.
--- ============================================================================
 
 json = {}
 
--- Helper: Identifies if a table is an array or a key-value object.
 local function kind_of(obj)
     if type(obj) ~= 'table' then
         return type(obj)
@@ -47,7 +38,6 @@ local function kind_of(obj)
     end
 end
 
--- Helper: Advances the parser past delimiters and whitespace.
 local function skip_delim(str, pos, delim, err_if_missing)
     pos = pos + #str:match('^%s*', pos)
     if str:sub(pos, pos) ~= delim then
@@ -59,7 +49,6 @@ local function skip_delim(str, pos, delim, err_if_missing)
     return pos + 1, true
 end
 
--- Helper: Parses JSON string literals, resolving escape sequences.
 local function parse_str_val(str, pos, val)
     val = val or ''
     local early_end_error = 'End of input found while parsing string.'
@@ -88,7 +77,6 @@ local function parse_str_val(str, pos, val)
     return parse_str_val(str, pos + 2, val .. (esc_map[nextc] or nextc))
 end
 
--- Helper: Parses numeric values (integers, floats, scientific notation).
 local function parse_num_val(str, pos)
     local num_str = str:match('^-?%d+%.?%d*[eE]?[+-]?%d*', pos)
     local val = tonumber(num_str)
@@ -100,7 +88,6 @@ end
 
 json.null = {}
 
--- Core JSON parsing function.
 function json.parse(str, pos, end_delim)
     pos = pos or 1
     if pos > #str then
@@ -161,14 +148,9 @@ function json.parse(str, pos, end_delim)
 end
 
 -- ============================================================================
--- 2. UI TOOLTIP SYSTEM
--- ============================================================================
--- The Tooltip system creates a floating-like window using Micro's split panes.
--- It strips standard UI elements (rulers, status lines) to mimic a pop-up menu.
+-- 2. UI TOOLTIP SYSTEM (ADAPTIVE MODE)
 -- ============================================================================
 
--- Transforms buffer logical coordinates (Loc) to screen visual coordinates.
--- Handles soft-wrap offsets to ensure precise positioning relative to the cursor.
 local function ScreenLocFromBufLoc(bp, loc)
     local vloc = bp:VLocFromLoc(loc)
     local ix, iy = vloc.VisualX, vloc.Line + vloc.Row
@@ -199,8 +181,6 @@ local function GetSplitIndex(bp)
     return bp:Tab():GetPane(bp:ID())
 end
 
--- Snapshots current pane layout to restore it after the tooltip closes.
--- This prevents the "destructive" split action from ruining the user's workspace.
 local function TabLayoutSnapshot(tab, tooltipIdx)
     local snapshot = {}
     local panes = tab.Panes
@@ -227,15 +207,12 @@ local function TabLayoutRecover(snapshot)
     end
 end
 
--- Initializes the scratch buffer for the tooltip.
--- Removes UI decorations like line numbers and status bars.
 local function SetTooltipBuffer(data, name)
     local buf = buffer.NewBuffer(data, name)
     buf.Type.Scratch = true
     buf.Type.Readonly = true
     buf:SetOptionNative("ruler", false)
     buf:SetOptionNative("statusline", false)
-    -- Clears the status format to remove the separator line artifact (----)
     buf:SetOptionNative("statusformatl", "")
     buf:SetOptionNative("statusformatr", "")
     buf:SetOptionNative("softwrap", false)
@@ -246,7 +223,7 @@ end
 local Tooltip = {}
 Tooltip.__index = Tooltip
 
--- Constructor: Creates the tooltip pane.
+-- ADAPTIVE CONSTRUCTOR
 function Tooltip.new(name, content, x, y, width, height)
     local self = setmetatable({}, Tooltip)
     self.name = name
@@ -259,13 +236,29 @@ function Tooltip.new(name, content, x, y, width, height)
     self.origin:HSplitIndex(buf, true)
     self.bp = micro.CurPane()
 
-    -- Add +1 padding to height to prevent last-line clipping.
-    self.bp:Resize(width, height + 1)
+    -- ADAPTIVE LOGIC:
+    -- 1. Calculate the absolute limit (Status Bar Y position)
+    local limitY = micro.InfoBar():GetView().Y
+
+    -- 2. Determine target height (Content + 1 padding for visual fix)
+    local targetHeight = height + 1
+
+    -- 3. Check if adding padding would cause a crash (Go beyond limit)
+    --    Note: y is the top of the tooltip.
+    if (y + targetHeight) > limitY then
+        -- If we can't fit the padding, stick to exact height (Prevent Crash)
+        targetHeight = limitY - y
+        -- Clamp to ensure we don't get negative height
+        if targetHeight < 1 then
+            targetHeight = 1
+        end
+    end
+
+    self.bp:Resize(width, targetHeight)
 
     local tooltipView = self.bp:GetView()
     tooltipView.X, tooltipView.Y = x, y
 
-    -- Force Reset Viewport: Ensures the list always starts from the top item.
     tooltipView.StartLine.Line = 0
     tooltipView.StartLine.Row = 0
 
@@ -274,7 +267,7 @@ function Tooltip.new(name, content, x, y, width, height)
     return self
 end
 
--- Updates the tooltip content and geometry without recreating the pane.
+-- ADAPTIVE UPDATE
 function Tooltip:Update(content, x, y, width, height)
     if not self.bp then
         return
@@ -282,12 +275,23 @@ function Tooltip:Update(content, x, y, width, height)
     self.bp.Buf:Replace(buffer.Loc(0, 0), self.bp.Buf:End(), content)
 
     local snapshot = TabLayoutSnapshot(self.origin:Tab(), GetSplitIndex(self.bp))
-    self.bp:Resize(width, height + 1)
+
+    -- Re-apply Adaptive Logic on Update
+    local limitY = micro.InfoBar():GetView().Y
+    local targetHeight = height + 1
+
+    if (y + targetHeight) > limitY then
+        targetHeight = limitY - y
+        if targetHeight < 1 then
+            targetHeight = 1
+        end
+    end
+
+    self.bp:Resize(width, targetHeight)
 
     local tooltipView = self.bp:GetView()
     tooltipView.X, tooltipView.Y = x, y
 
-    -- Reset Viewport on update to sync with scroll logic.
     tooltipView.StartLine.Line = 0
     tooltipView.StartLine.Row = 0
 
@@ -313,36 +317,32 @@ end
 -- 3. GLOBAL STATE & CONFIGURATION
 -- ============================================================================
 
-cmd = nil -- Subprocess handle for the Language Server
-currentAction = {} -- Callback for the pending async request
-requestId = 0 -- RPC ID counter
-message = '' -- Stream buffer
-rootUri = '' -- Project root URI
-completionResults = {} -- Autocomplete candidates
-selectedIndex = 1 -- Cursor index in completion list
-activeTooltip = nil -- Active tooltip instance
-isFormatting = false -- Semaphore for formatting operations
-version = {} -- File versioning
-capabilities = {} -- Server capabilities
-scrollOffset = 0 -- Pagination state
+cmd = nil
+currentAction = {}
+requestId = 0
+message = ''
+rootUri = ''
+completionResults = {}
+selectedIndex = 1
+activeTooltip = nil
+isFormatting = false
+version = {}
+capabilities = {}
+scrollOffset = 0
 
 function init()
-    -- Register Options with 'lsppp' prefix
     config.RegisterCommonOption("lsppp", "autoformat", true)
     config.RegisterCommonOption("lsppp", "autostart", true)
     config.RegisterCommonOption("lsppp", "autocomplete", true)
 
-    -- Register Commands (using 'lsppp' prefix)
     config.MakeCommand("lspppstart", startServer, config.NoComplete)
     config.MakeCommand("lspppstop", stopServer, config.NoComplete)
     config.MakeCommand("lspppformat", formatAction, config.NoComplete)
     config.MakeCommand("lspppdef", definitionAction, config.NoComplete)
     config.MakeCommand("lsppprefs", referencesAction, config.NoComplete)
 
-    -- Core Completion Command
     config.MakeCommand("lspppcomplete", completionAction, config.NoComplete)
 
-    -- Internal Navigation Commands (Bound dynamically)
     config.MakeCommand("lsppp_confirm", function()
         ConfirmCompletion(micro.CurPane())
     end, config.NoComplete)
@@ -351,7 +351,6 @@ function init()
     end, config.NoComplete)
     config.MakeCommand("lsppp_backspace", backspaceAction, config.NoComplete)
 
-    -- Default Keybinding
     config.TryBindKey("CtrlSpace", "command:lspppcomplete", true)
 end
 
@@ -368,7 +367,6 @@ function getUriFromBuf(buf)
     return uri
 end
 
--- Sends a JSON-RPC message to the server.
 function send(method, params, isNotification)
     if cmd == nil then
         return
@@ -380,7 +378,6 @@ function send(method, params, isNotification)
     shell.JobSend(cmd, msg)
 end
 
--- Processes stdout stream, handling fragmentation.
 function onStdout(text)
     message = message .. text
     while true do
@@ -423,7 +420,6 @@ end
 -- 5. HELPERS
 -- ============================================================================
 
--- Identifies the word prefix at the cursor for fuzzy filtering.
 function getWordPrefix(bp)
     local line = bp.Buf:Line(bp.Cursor.Y)
     local x = bp.Cursor.X
@@ -452,10 +448,9 @@ function getWordPrefix(bp)
 end
 
 -- ============================================================================
--- 6. UI LAYOUT ENGINE
+-- 6. UI LAYOUT ENGINE (SAFE CALCULATION)
 -- ============================================================================
 
--- Calculates optimal tooltip placement to avoid screen edges and the Status Bar.
 local function FitAroundLocation(bp, loc, maxWidth, maxHeight)
     local ScreenLoc = ScreenLocFromBufLoc(bp, loc)
     local bufView = bp:BufView()
@@ -470,25 +465,29 @@ local function FitAroundLocation(bp, loc, maxWidth, maxHeight)
     local y = ScreenLoc.Y + 1
 
     local spaceAbove = ScreenLoc.Y - bufView.Y
-    -- Safety margin (-1) to avoid rendering over the InfoBar
-    local spaceBelow = infoBarY - y - 1
+
+    -- Calculate STRICT space below (no padding assumed yet)
+    local spaceBelow = 0
+    if infoBarY > y then
+        spaceBelow = infoBarY - y
+    end
 
     local width, height = maxWidth, maxHeight
 
     if spaceBelow < height then
         if spaceAbove > spaceBelow then
-            -- Prefer placement above if more space is available
+            -- Prefer placement above
             height = math.min(height, spaceAbove)
             y = ScreenLoc.Y - height
         else
-            -- Clip height to available space below
+            -- Clip to space below
             height = spaceBelow
         end
     end
 
+    height = math.max(1, height)
     x = math.max(0, x)
     y = math.max(0, y)
-    height = math.max(1, height)
 
     return x, y, width, height
 end
@@ -532,7 +531,6 @@ function handleCompletionResults(bp, data)
     local prefix = getWordPrefix(bp)
     local filtered = {}
 
-    -- Client-side fuzzy filtering
     for _, item in ipairs(results) do
         local label = item.label
         if string.lower(label):find(string.lower(prefix), 1, true) then
@@ -585,7 +583,6 @@ function ShowAutocompleteTooltip(bp)
 
     local x, y, realWidth, realHeight = FitAroundLocation(bp, loc, maxWidth, reqHeight)
 
-    -- Dynamic Viewport Pagination
     local pageSize = realHeight
 
     if selectedIndex > scrollOffset + pageSize then
@@ -624,13 +621,12 @@ function ShowAutocompleteTooltip(bp)
 
     if not activeTooltip then
         activeTooltip = Tooltip.new("completion", content, x, y, realWidth, realHeight)
-        -- Hijack Keys for Tooltip Navigation
+
         config.TryBindKey("Enter", "command:lsppp_confirm", true)
         config.TryBindKey("Tab", "command:lsppp_confirm", true)
         config.TryBindKey("Esc", "command:lsppp_escape", true)
         config.TryBindKey("Backspace", "command:lsppp_backspace", true)
 
-        -- Bind Scroll keys to escape (prevents floating tooltip on scroll)
         config.TryBindKey("MouseWheelUp", "command:lsppp_escape", true)
         config.TryBindKey("MouseWheelDown", "command:lsppp_escape", true)
         config.TryBindKey("PageUp", "command:lsppp_escape", true)
@@ -641,12 +637,10 @@ function ShowAutocompleteTooltip(bp)
 end
 
 function CloseTooltip()
-    -- Restore Default Keybindings
     config.TryBindKey("Enter", "InsertNewline", true)
     config.TryBindKey("Tab", "IndentSelection,InsertTab", true)
     config.TryBindKey("Esc", "Escape", true)
     config.TryBindKey("Backspace", "Backspace", true)
-    -- Fix: Map scroll keys back to their correct actions
     config.TryBindKey("MouseWheelUp", "ScrollUp", true)
     config.TryBindKey("MouseWheelDown", "ScrollDown", true)
     config.TryBindKey("PageUp", "PageUp", true)
@@ -721,7 +715,6 @@ function ConfirmCompletion(bp)
     CloseTooltip()
 end
 
--- Use hooks for navigation to prevent cursor movement conflict
 function preCursorUp(bp)
     if activeTooltip then
         cycleSelection(-1);
@@ -802,7 +795,6 @@ function formatAction(bp)
                 return
             end
             local edits = data.result
-            -- Reverse sort edits to ensure line integrity during processing
             table.sort(edits, function(left, right)
                 if left.range.start.line ~= right.range.start.line then
                     return left.range.start.line > right.range.start.line
@@ -844,7 +836,6 @@ function startServer(bp)
     rootUri = fmt.Sprintf("file://%s", wd);
     requestId = 0;
     message = ''
-    -- Note: We still spawn 'clangd' as the executable
     cmd = shell.JobSpawn("clangd", {"--background-index", "--header-insertion=never"}, onStdout, onStderr, onExit, {})
     if cmd then
         currentAction = {
@@ -921,7 +912,6 @@ function handleDiagnostics(params)
         return
     end
 
-    -- Use 'lsppp' owner for diagnostics
     bp:ClearMessages("lsppp")
     for _, diagnostic in ipairs(params.diagnostics or {}) do
         local msgType = buffer.MTInfo
